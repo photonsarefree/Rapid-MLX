@@ -300,6 +300,15 @@ def mtp_generate_step(
         "true",
         "on",
     )
+    # E5 greedy-draft (MTPLX lesson): at temp>0, the drafter proposes
+    # argmax with a one-hot q (accept = p_target(draft) — still exact
+    # LC), skipping the drafter-side filter chain + 248k categorical.
+    # No effect at temp=0 (drafts are already argmax).
+    _greedy_draft = (
+        not _is_greedy
+        and os.environ.get("RAPID_MLX_MTP_GREEDY_DRAFT", "").strip()
+        in ("1", "true", "on")
+    )
     # uzu-lift stage 1 A/B toggle: RAPID_MLX_MTP_SYNC_CHAIN=1 forces the
     # old blocking eval after the draft chain (pre-stage-1 behavior).
     _sync_chain = os.environ.get("RAPID_MLX_MTP_SYNC_CHAIN", "").strip() in (
@@ -354,13 +363,23 @@ def mtp_generate_step(
         kv_bits=kv_bits,
     )
 
-    def _process_and_sample(tokens, logits, xtc_draw=None):
+    def _process_and_sample(tokens, logits, xtc_draw=None, greedy_override=False):
         if logits_processors:
             logits = logits[None]
             for processor in logits_processors:
                 logits = processor(tokens, logits)
             logits = logits.squeeze(0)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if greedy_override:
+            # E5 greedy-draft (MTPLX lesson): the DRAFTER proposes its
+            # argmax even when the request samples at temp>0. The
+            # proposal distribution q becomes one-hot, so the
+            # Leviathan-Chen accept degenerates to p_target(draft) —
+            # still exact — while the drafter skips the filter-chain +
+            # categorical over the 248k vocab. ``lp_accept=None``
+            # signals the one-hot accept math to the verify round.
+            token = mx.argmax(logprobs, axis=-1)
+            return token, logprobs, None
         if _filter_chain:
             if _xtc_cell is not None:
                 _xtc_cell[0] = xtc_draw  # None = fresh draw; mx.array = shared
@@ -553,7 +572,8 @@ def mtp_generate_step(
                 tokens_for_proc = prev
             xtc_draw = mx.random.uniform() if _xtc_cell is not None else None
             draft_tok, draft_lp, draft_accept_lp = _process_and_sample(
-                tokens_for_proc, mtp_logits, xtc_draw
+                tokens_for_proc, mtp_logits, xtc_draw,
+                greedy_override=_greedy_draft,
             )
         return draft_tok, draft_lp, draft_accept_lp, xtc_draw, drafter_hidden_last
 
@@ -876,6 +896,24 @@ def mtp_generate_step(
                 # target's argmax, which coincides with target argmax).
                 accept_mask_arr = toks[:k_len].astype(mx.int32) == drafts_i32
                 residual_toks_arr = toks[:k_len]
+                bonus_tok_arr = toks[k_len]
+            elif _greedy_draft:
+                # E5 greedy-draft accept math: q is one-hot at the
+                # draft token, so min(1, p/q) = p_target(draft) and the
+                # residual is p_target with the draft token zeroed,
+                # renormalized. Exact Leviathan-Chen for a degenerate
+                # proposal — same marginal as plain sampling.
+                v_alps = accept_lps[:k_len]  # (K, V)
+                idx = drafts_i32.reshape(-1, 1)  # (K, 1)
+                v_at = mx.take_along_axis(v_alps, idx, axis=1).squeeze(-1)
+                accept_mask_arr = u < mx.exp(v_at)  # log_accept = v_at <= 0
+                p_target = mx.exp(v_alps)  # (K, V)
+                residual = mx.put_along_axis(
+                    p_target, idx, mx.zeros_like(v_at).reshape(-1, 1), axis=1
+                )
+                z = residual.sum(axis=-1, keepdims=True)
+                dist = mx.where(z > 0, residual, p_target)
+                residual_toks_arr = mx.random.categorical(mx.log(dist))
                 bonus_tok_arr = toks[k_len]
             else:
                 # Vectorized per-position log-accept over the K draft
