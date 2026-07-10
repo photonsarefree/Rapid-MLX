@@ -54,7 +54,10 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 _KIND_FA = "fa"
+_KIND_FAB = "fab"  # BatchKVCache (the rapid-mlx batch scheduler path, B=1)
 _KIND_GDN = "gdn"
+
+_STATE_IN_LEAVES = {_KIND_FA: 3, _KIND_FAB: 5, _KIND_GDN: 2}
 
 
 def compiled_verify_enabled() -> bool:
@@ -117,6 +120,54 @@ class _ShadowKVCache:
         mask = linds[:, None] >= rinds[None, :]
         if window_size is not None:
             mask = mask & (linds[:, None] < rinds[None, :] + window_size)
+        return mask
+
+
+class _ShadowBatchKVCache:
+    """Fixed-capacity stand-in for a stock ``BatchKVCache`` (B=1 decode).
+
+    Mirrors the stock semantics exactly: ``_idx`` is the buffer write
+    position (tensor here, Python int on the real entry), ``offset`` is
+    the per-row position array RoPE consumes directly, and the mask is
+    the stock ``create_causal_mask(N, offset=_idx, left_padding=...)``
+    boolean array widened from ``_idx+N`` to the full buffer capacity —
+    the padding columns are masked out, which probe_e8 measured as
+    bit-neutral.
+    """
+
+    def __init__(self) -> None:
+        self.keys = None
+        self.values = None
+        self.offset = None  # mx.array (B,), what rope reads
+        self.left_padding = None  # mx.array (B,)
+        self._idx = None  # mx.array, int32 scalar write position
+        self.capacity = 0
+
+    def seed(self, keys, values, idx, offset, left_padding) -> None:
+        self.keys = keys
+        self.values = values
+        self._idx = idx
+        self.offset = offset
+        self.left_padding = left_padding
+        self.capacity = int(keys.shape[2])
+
+    def update_and_fetch(self, keys, values):
+        steps = int(keys.shape[2])
+        self.keys = mx.slice_update(self.keys, keys, self._idx, axes=(2,))
+        self.values = mx.slice_update(self.values, values, self._idx, axes=(2,))
+        self.offset = self.offset + steps
+        self._idx = self._idx + steps
+        return self.keys, self.values
+
+    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+        del return_array
+        window_size = kwargs.get("window_size")
+        rinds = mx.arange(self.capacity)[None]
+        linds = (self._idx + mx.arange(N))[:, None]
+        mask = linds >= rinds
+        if window_size is not None:
+            mask = mask & (linds < rinds + window_size)
+        mask = mask & (mx.expand_dims(self.left_padding, (1, 2, 3)) <= rinds)
         return mask
 
 
@@ -204,6 +255,20 @@ class CompiledVerify:
             )
             return self._miss(f"exception:{type(exc).__name__}")
         self._failures = 0
+        if self.stats["compiled_calls"] == 0:
+            capacities = [
+                int(cache[idx].keys.shape[2])
+                for idx, kind in self._spec or []
+                if kind in (_KIND_FA, _KIND_FAB)
+            ]
+            logger.info(
+                "[MTP-compiled-verify] engaged: S=%d n_confirmed=%d "
+                "fa_capacity=%s traces=%d",
+                S,
+                n_confirmed,
+                capacities[:1],
+                self.stats["traces"],
+            )
         self.stats["compiled_calls"] += 1
         self._commit(cache, state_out, S, int(n_confirmed))
         self._clear_shadow_refs()
@@ -212,6 +277,11 @@ class CompiledVerify:
     def _miss(self, reason: str):
         reasons = self.stats["fallback_reasons"]
         reasons[reason] = reasons.get(reason, 0) + 1
+        if reasons[reason] == 1 and reason != "disabled":
+            # First occurrence of each fallback reason is operator-visible:
+            # a silently-eager bank looks identical to a working one from
+            # the outside (same tokens), so surface why it missed.
+            logger.info("[MTP-compiled-verify] eager fallback: %s", reason)
         return None
 
     # -- preconditions ------------------------------------------------------
@@ -219,11 +289,11 @@ class CompiledVerify:
     def _eligibility(self, cache, S: int) -> str | None:
         if cache is None:
             return "no_cache"
-        from mlx_lm.models.cache import ArraysCache, KVCache
+        from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
 
         spec: list[tuple[int, str]] = []
         for idx, entry in enumerate(cache):
-            # Exact-type checks: subclasses (BatchKVCache, QuantizedKVCache,
+            # Exact-type checks: other subclasses (QuantizedKVCache,
             # rotating variants) have different update/mask semantics and
             # must stay on the eager path.
             if type(entry) is KVCache:
@@ -232,6 +302,14 @@ class CompiledVerify:
                 if not isinstance(entry.offset, int):
                     return "kv_offset_not_int"
                 spec.append((idx, _KIND_FA))
+            elif type(entry) is BatchKVCache:
+                if entry.keys is None or entry.values is None:
+                    return "kv_empty"
+                if not isinstance(entry._idx, int):
+                    return "kv_idx_not_int"
+                if entry._right_padding is not None:
+                    return "kv_right_padding_pending"
+                spec.append((idx, _KIND_FAB))
             elif type(entry) is ArraysCache:
                 if len(entry.cache) != 2:
                     return "gdn_slots"
@@ -242,7 +320,7 @@ class CompiledVerify:
                 spec.append((idx, _KIND_GDN))
             else:
                 return f"unsupported:{type(entry).__name__}"
-        if not any(kind == _KIND_FA for _idx, kind in spec):
+        if not any(kind in (_KIND_FA, _KIND_FAB) for _idx, kind in spec):
             return "no_full_attn"
         self._spec = spec
         return None
@@ -257,12 +335,13 @@ class CompiledVerify:
         """
         reserve = _growth_reserve()
         for idx, kind in self._spec or []:
-            if kind != _KIND_FA:
+            if kind not in (_KIND_FA, _KIND_FAB):
                 continue
             entry = cache[idx]
             step = int(getattr(entry, "step", 256) or 256)
             capacity = int(entry.keys.shape[2])
-            needed = int(entry.offset) + S
+            write_pos = entry.offset if kind == _KIND_FA else entry._idx
+            needed = int(write_pos) + S
             if needed <= capacity:
                 continue
             target = needed + reserve
@@ -289,7 +368,12 @@ class CompiledVerify:
 
         shadow: list[Any] = [None] * len(cache)
         for idx, kind in self._spec or []:
-            shadow[idx] = _ShadowKVCache() if kind == _KIND_FA else ArraysCache(size=2)
+            if kind == _KIND_FA:
+                shadow[idx] = _ShadowKVCache()
+            elif kind == _KIND_FAB:
+                shadow[idx] = _ShadowBatchKVCache()
+            else:
+                shadow[idx] = ArraysCache(size=2)
         self._shadow = shadow
         self._shadow_sig = sig
 
@@ -307,6 +391,12 @@ class CompiledVerify:
                 entry.keys = None
                 entry.values = None
                 entry.offset = None
+            elif isinstance(entry, _ShadowBatchKVCache):
+                entry.keys = None
+                entry.values = None
+                entry.offset = None
+                entry.left_padding = None
+                entry._idx = None
             else:
                 entry.cache[0] = None
                 entry.cache[1] = None
@@ -335,12 +425,19 @@ class CompiledVerify:
                 entry = shadow[idx]
                 if kind == _KIND_FA:
                     entry.seed(state_in[pos], state_in[pos + 1], state_in[pos + 2])
-                    pos += 3
+                elif kind == _KIND_FAB:
+                    entry.seed(
+                        state_in[pos],
+                        state_in[pos + 1],
+                        state_in[pos + 2],
+                        state_in[pos + 3],
+                        state_in[pos + 4],
+                    )
                 else:
                     entry.cache[0] = state_in[pos]
                     entry.cache[1] = state_in[pos + 1]
                     entry.rollback_state = None
-                    pos += 2
+                pos += _STATE_IN_LEAVES[kind]
             # (2) The existing forward — including the GatedDeltaNet
             # chunk-split — against shadow containers only.
             logits, hidden = model(
@@ -355,6 +452,8 @@ class CompiledVerify:
                 entry = shadow[idx]
                 if kind == _KIND_FA:
                     state_out.extend((entry.keys, entry.values))
+                elif kind == _KIND_FAB:
+                    state_out.extend((entry.keys, entry.values, entry.offset))
                 else:
                     snaps = entry.rollback_state
                     if not isinstance(snaps, dict) or sorted(snaps) != boundaries:
@@ -380,15 +479,24 @@ class CompiledVerify:
                 leaves.extend(
                     (entry.keys, entry.values, mx.array(entry.offset, dtype=mx.int32))
                 )
+            elif kind == _KIND_FAB:
+                leaves.extend(
+                    (
+                        entry.keys,
+                        entry.values,
+                        mx.array(entry._idx, dtype=mx.int32),
+                        entry.offset,
+                        entry.left_padding,
+                    )
+                )
             else:
                 leaves.extend((entry.cache[0], entry.cache[1]))
         return leaves
 
     def _unpack(self, outputs, S: int, n_confirmed: int):
         n_bound = S - n_confirmed
-        n_state = sum(
-            2 if kind == _KIND_FA else 2 + 2 * n_bound for _idx, kind in self._spec or []
-        )
+        out_leaves = {_KIND_FA: 2, _KIND_FAB: 3, _KIND_GDN: 2 + 2 * n_bound}
+        n_state = sum(out_leaves[kind] for _idx, kind in self._spec or [])
         expected = 2 + n_state
         if len(outputs) != expected:
             raise ValueError(
@@ -415,6 +523,12 @@ class CompiledVerify:
                 entry.values = state_out[pos + 1]
                 entry.offset = int(entry.offset) + S
                 pos += 2
+            elif kind == _KIND_FAB:
+                entry.keys = state_out[pos]
+                entry.values = state_out[pos + 1]
+                entry.offset = state_out[pos + 2]
+                entry._idx = int(entry._idx) + S
+                pos += 3
             else:
                 entry.cache[0] = state_out[pos]
                 entry.cache[1] = state_out[pos + 1]
