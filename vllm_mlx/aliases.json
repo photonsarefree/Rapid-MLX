@@ -226,8 +226,9 @@
     "is_hybrid": false,
     "is_hybrid_explicit": true,
     "supports_spec_decode": false,
-    "supports_dflash": false,
-    "pflash_tier": "verified"
+    "supports_dflash": true,
+    "pflash_tier": "verified",
+    "dflash_draft_model": "z-lab/Qwen3.6-27B-DFlash"
   },
   "qwen3.6-27b-6bit": {
     "hf_path": "lmstudio-community/Qwen3.6-27B-MLX-6bit",

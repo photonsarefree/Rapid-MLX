@@ -205,7 +205,16 @@ def _detect_mtp_eligibility_verbose(
             f"model_type {model_type!r} not in MTP allowlist",
         )
 
-    num_mtp_layers = _safe_int(config.get("mtp_num_hidden_layers"), 0)
+    # Qwen3.6 checkpoints are VLM-wrapped: ``mtp_num_hidden_layers``
+    # lives under ``text_config`` (the injector already reads it from
+    # there at runtime) — fall back to the nested dict so eligibility
+    # matches what inject_mtp_support will actually see.
+    _mtp_raw = config.get("mtp_num_hidden_layers")
+    if _mtp_raw is None:
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            _mtp_raw = text_config.get("mtp_num_hidden_layers")
+    num_mtp_layers = _safe_int(_mtp_raw, 0)
     if num_mtp_layers <= 0:
         # External-sidecar path (Gemma 4 unified only): the operator
         # has passed ``--mtp-sidecar <path>`` at the CLI, meaning the

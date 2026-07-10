@@ -65,6 +65,8 @@ _DEFAULT_REGISTRY: dict[str, str] = {
     # honestly ship today. Add an entry back after a future bench
     # verifies the alias passes SOP §6 with the non-code-floor rule.
     "qwen3.5-27b-8bit": "z-lab/Qwen3.5-27B-DFlash",
+    # optim: enabled for benchmarking (single-user, code-only; tools disabled).
+    "qwen3.6-27b-8bit": "z-lab/Qwen3.6-27B-DFlash",
 }
 
 # Working copy populated from ``_DEFAULT_REGISTRY`` at module import.

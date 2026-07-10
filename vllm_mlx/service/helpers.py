@@ -1737,6 +1737,21 @@ def _extract_thinking_from_request(request) -> bool | None:
     return getattr(request, "enable_thinking", None)
 
 
+def _default_thinking_on() -> bool:
+    """Operator override: RAPID_MLX_DEFAULT_THINKING=1 makes thinking the
+    server-side default for requests that did not pin a preference —
+    including tool-calling requests (skips the R12-T1F auto-disable).
+    Per-request ``enable_thinking: false`` still wins."""
+    import os
+
+    return os.environ.get("RAPID_MLX_DEFAULT_THINKING", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _resolve_enable_thinking(request) -> bool | None:
     """Resolve enable_thinking precedence for OpenAI/anthropic routes.
 
@@ -1757,7 +1772,10 @@ def _resolve_enable_thinking(request) -> bool | None:
     cfg = get_config()
     if cfg.no_thinking:
         return False
-    return _extract_thinking_from_request(request)
+    pinned = _extract_thinking_from_request(request)
+    if pinned is None and _default_thinking_on():
+        return True
+    return pinned
 
 
 def maybe_auto_disable_thinking_for_tools(request) -> bool:
@@ -1805,6 +1823,10 @@ def maybe_auto_disable_thinking_for_tools(request) -> bool:
     route's structured log line; callers that do not need it can
     discard the return value.
     """
+    if _default_thinking_on():
+        # Operator pinned thinking-on server-wide — skip the tools
+        # auto-disable entirely (they accept the token-budget risk).
+        return False
     tools = getattr(request, "tools", None)
     if not tools:
         return False
@@ -1932,6 +1954,10 @@ def maybe_auto_disable_thinking_for_casual_chat(request, *, extra_signals=None) 
     or client signalled reasoning intent). The returned bool is the
     load-bearing signal for the route's structured log line.
     """
+    if _default_thinking_on():
+        # Operator pinned thinking-on server-wide (RAPID_MLX_DEFAULT_THINKING)
+        # -- skip the casual-chat auto-disable, same as the tools gate.
+        return False
     cfg = get_config()
     # Gate on the model actually being thinking-capable. Without a
     # registered reasoning parser the engine never produces ``<think>``
