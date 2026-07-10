@@ -300,6 +300,31 @@ def mtp_generate_step(
         "true",
         "on",
     )
+    # RAPID_MLX_MTP_TIMING=1: per-round phase breakdown, logged at generator
+    # teardown. Measures the headroom a uzu-style GPU-chained decode
+    # (submit-next-before-sync) could recover: everything outside
+    # ``eval_wait`` is CPU-serialized time the GPU spends idle.
+    _timing = os.environ.get("RAPID_MLX_MTP_TIMING", "").strip() in (
+        "1",
+        "true",
+        "on",
+    )
+    _t_acc = {"rounds": 0, "chain_s": 0.0, "build_s": 0.0, "eval_wait_s": 0.0, "host_s": 0.0}
+
+    def _t_dump():
+        if _timing and _t_acc["rounds"]:
+            r = _t_acc["rounds"]
+            logger.info(
+                "[MTP-timing] rounds=%d chain=%.2fms build=%.2fms "
+                "eval_wait=%.2fms host=%.2fms per-round "
+                "(gpu-idle-recoverable ≈ chain+build+host = %.2fms)",
+                r,
+                1e3 * _t_acc["chain_s"] / r,
+                1e3 * _t_acc["build_s"] / r,
+                1e3 * _t_acc["eval_wait_s"] / r,
+                1e3 * _t_acc["host_s"] / r,
+                1e3 * (_t_acc["chain_s"] + _t_acc["build_s"] + _t_acc["host_s"]) / r,
+            )
 
     _filter_chain, _xtc_cell = (
         _make_sampler_chain(
@@ -604,11 +629,17 @@ def mtp_generate_step(
         # started, which ate the whole depth-2 tokens/round gain.
         # Chaining lazily is legal (the next ``mtp_forward`` consumes
         # ``prev_tok``/``cur_hidden`` as graph inputs, never via
-        # ``.item()``); one eval at chain end bounds the pending graph
-        # while costing a single sync regardless of K. (MTPLX solves
-        # the same overhead with an mx.compile'd fused draft core;
-        # this is the dependency-only version.)
-        mx.eval(*draft_toks)
+        # ``.item()``).
+        #
+        # uzu-lift (GPU-chained decode, stage 1): submit the drafts
+        # ASYNC instead of blocking — the GPU starts executing the
+        # draft forwards while the CPU builds the (K+1)-row verify
+        # graph (~4ms measured at K=2), which only consumes the draft
+        # tokens as lazy graph inputs. The verify round's single sync
+        # is the one true barrier. Measured phase breakdown that
+        # motivated this: build 4.0ms + chain 3.0ms + host 0.8ms
+        # CPU-serialized vs 16.7ms GPU verify per K=2 round.
+        mx.async_eval(*draft_toks)
         return draft_toks, draft_lps, draft_accept_lps, xtc_draws
 
     def _prefill(yy, embeddings):
@@ -708,8 +739,20 @@ def mtp_generate_step(
             return
         _controller.record(k_used, round_wall_ms, accepts)
 
+    _t_state: dict = {"eval_end": None, "chain_win": 0.0}
     while ntoks < max_tokens:
         round_start_perf = time.perf_counter()
+        if _timing and _t_state["eval_end"] is not None:
+            # Host window = everything between the previous round's eval
+            # completing and this round starting (accept walk, yields,
+            # scheduler emit bookkeeping), minus the draft-chain call that
+            # also lives in that window (counted separately as chain_s).
+            _post = round_start_perf - _t_state["eval_end"]
+            _t_acc["host_s"] += max(0.0, _post - _t_state["chain_win"])
+            _t_state["eval_end"] = None
+            _t_state["chain_win"] = 0.0
+            if _t_acc["rounds"] % 50 == 0:
+                _t_dump()
         if pending_drafts is None:
             # -------------------------------------------------------
             # Round K=0 (either bootstrap or a park). Plain backbone
@@ -850,7 +893,14 @@ def mtp_generate_step(
                 bonus_tok_arr = toks[k_len]
 
             # ------- SINGLE SYNC -------
+            _t_pre_eval = time.perf_counter() if _timing else 0.0
             mx.eval(toks, accept_mask_arr, residual_toks_arr, bonus_tok_arr, u)
+            if _timing:
+                _t_now = time.perf_counter()
+                _t_acc["rounds"] += 1
+                _t_acc["build_s"] += _t_pre_eval - round_start_perf
+                _t_acc["eval_wait_s"] += _t_now - _t_pre_eval
+                _t_state["eval_end"] = _t_now
 
             # ------- Host-side read (all values already resident) -------
             accept_flags = accept_mask_arr.tolist()
@@ -1046,6 +1096,7 @@ def mtp_generate_step(
                 else:
                     cache_commit = None
                 last_committed_tok = mx.array([last_committed_tok_id], mx.uint32)
+                _t_chain0 = time.perf_counter() if _timing else 0.0
                 d_toks, d_lps, d_alps, d_xtcs = _step_mtp_chain(
                     last_committed_hidden,
                     last_committed_tok,
@@ -1053,6 +1104,10 @@ def mtp_generate_step(
                     next_k,
                     cache_commit=cache_commit,
                 )
+                if _timing:
+                    _dt = time.perf_counter() - _t_chain0
+                    _t_acc["chain_s"] += _dt
+                    _t_state["chain_win"] += _dt
                 pending_drafts = list(zip(d_toks, d_lps, d_alps, d_xtcs))
             else:
                 pending_drafts = None
