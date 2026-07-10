@@ -6093,7 +6093,27 @@ def telemetry_command(args) -> None:
     sys.exit(1)
 
 
+def _maybe_fuse_moe_gateup():
+    """Apply the MoE gate/up expert-projection fusion (default on).
+
+    One gather_qmm dispatch instead of two per MoE layer; token-exact.
+    RAPID_MLX_MOE_FUSED_GATEUP=0 opts out. Safe no-op when the model has
+    no SwitchGLU layers or the fusion is already applied.
+    """
+    import os as _os
+
+    if _os.environ.get("RAPID_MLX_MOE_FUSED_GATEUP", "1").strip() in ("0", "false", "off"):
+        return
+    try:
+        from .moe_fused_gateup import apply as _fuse_apply
+
+        _fuse_apply()
+    except Exception:  # noqa: BLE001 — never block serving on the lever
+        pass
+
+
 def main():
+    _maybe_fuse_moe_gateup()
     from importlib.metadata import version as pkg_version
 
     try:
