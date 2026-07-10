@@ -760,6 +760,23 @@ def mtp_generate_step(
         max_k_effective = _fixed_k
         _controller = None
 
+    # Lever E8: trace/refresh the compiled verify entries for every verify
+    # window this request can produce, BEFORE the first round. The depth
+    # controller's cost EWMA samples every round's wall time; paying the
+    # one-time compile traces inside a round seeds the per-K cost model
+    # ~3x too high and it parks the drafter for the rest of the request
+    # (measured: 95.7 -> 78.2 tok/s through the server bench, fingerprint
+    # unchanged). At steady state (shapes already warm) this is a dict
+    # lookup per request.
+    if _cv_bank is not None:
+        _s_list = (
+            [_fixed_k + 1]
+            if _controller is None
+            else list(range(2, max_k_effective + 2))
+        )
+        with mx.stream(generation_stream):
+            _cv_bank.prewarm(model_cache, _s_list, n_confirmed=1)
+
     # next_k: the K the controller wants for the UPCOMING round. Determines
     # whether we generate a draft at end of the current round. Bootstrap
     # value is the controller's initial pick_k (0 if fresh, else the

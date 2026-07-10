@@ -191,6 +191,7 @@ class CompiledVerify:
         self._spec: list[tuple[int, str]] | None = None
         self._shadow: list[Any] | None = None
         self._shadow_sig: tuple | None = None
+        self._warm_sigs: dict[tuple[int, int], tuple] = {}
         self.stats: dict[str, Any] = {
             "calls": 0,
             "compiled_calls": 0,
@@ -273,6 +274,63 @@ class CompiledVerify:
         self._commit(cache, state_out, S, int(n_confirmed))
         self._clear_shadow_refs()
         return logits, hidden
+
+    def prewarm(self, cache, s_values, n_confirmed: int = 1) -> None:
+        """Pay compile traces OUTSIDE the decode loop.
+
+        The EV depth controller folds every round's wall time into a
+        per-K cost EWMA whose FIRST sample seeds the estimate directly
+        and whose later innovations are clamped to +/-25% — so a single
+        in-band trace stall (~30-60ms vs ~20ms steady at K=2) teaches it
+        that drafting is expensive and it parks the drafter for hundreds
+        of tokens (measured through the server bench: 95.7 -> 78.2 tok/s
+        with in-band traces, fingerprint unchanged). Running the trace +
+        first execution here — after prefill, before the first round —
+        keeps the controller's cost model clean.
+
+        The verify step is a pure function of its explicit inputs, so
+        executing it against the live cache leaves and DISCARDING the
+        outputs leaves the real cache untouched (only the pre-growth
+        capacity padding is observable, and eager consumers slice to
+        offset). Re-warms only when the leaf-shape signature changed
+        (fresh process, or a request whose prompt landed in a different
+        capacity class); otherwise this is a dict lookup per request.
+        """
+        if self.disabled:
+            return
+        for S in sorted({int(s) for s in s_values}):
+            if S < 2 or not (0 < int(n_confirmed) < S):
+                continue
+            if self._eligibility(cache, S) is not None:
+                return
+            key = (S, int(n_confirmed))
+            try:
+                self._ensure_capacity(cache, S)
+                self._ensure_shadow(cache)
+                state_in = self._read_state(cache)
+                sig = tuple((tuple(l.shape), str(l.dtype)) for l in state_in)
+                if self._warm_sigs.get(key) == sig and key in self._compiled:
+                    continue
+                fn = self._compiled.get(key)
+                if fn is None:
+                    fn = mx.compile(self._make_verify_step(S, int(n_confirmed)))
+                    self._compiled[key] = fn
+                tokens = mx.zeros((1, S), dtype=mx.uint32)
+                outputs = fn(tokens, *state_in)
+                # Blocking eval: the trace happened on the call above; this
+                # forces the Metal pipeline builds for the fused kernels so
+                # the first real round replays at steady-state cost.
+                mx.eval(*outputs)
+                self._warm_sigs[key] = sig
+                self._clear_shadow_refs()
+            except Exception as exc:  # noqa: BLE001 — prewarm must never break decode
+                logger.warning(
+                    "[MTP-compiled-verify] prewarm S=%d failed (%s: %s)",
+                    S,
+                    type(exc).__name__,
+                    exc,
+                )
+                return
 
     def _miss(self, reason: str):
         reasons = self.stats["fallback_reasons"]
