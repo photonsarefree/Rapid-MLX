@@ -300,6 +300,13 @@ def mtp_generate_step(
         "true",
         "on",
     )
+    # uzu-lift stage 1 A/B toggle: RAPID_MLX_MTP_SYNC_CHAIN=1 forces the
+    # old blocking eval after the draft chain (pre-stage-1 behavior).
+    _sync_chain = os.environ.get("RAPID_MLX_MTP_SYNC_CHAIN", "").strip() in (
+        "1",
+        "true",
+        "on",
+    )
     # RAPID_MLX_MTP_TIMING=1: per-round phase breakdown, logged at generator
     # teardown. Measures the headroom a uzu-style GPU-chained decode
     # (submit-next-before-sync) could recover: everything outside
@@ -639,7 +646,11 @@ def mtp_generate_step(
         # is the one true barrier. Measured phase breakdown that
         # motivated this: build 4.0ms + chain 3.0ms + host 0.8ms
         # CPU-serialized vs 16.7ms GPU verify per K=2 round.
-        mx.async_eval(*draft_toks)
+        # RAPID_MLX_MTP_SYNC_CHAIN=1 restores the old blocking eval for A/B.
+        if _sync_chain:
+            mx.eval(*draft_toks)
+        else:
+            mx.async_eval(*draft_toks)
         return draft_toks, draft_lps, draft_accept_lps, xtc_draws
 
     def _prefill(yy, embeddings):
