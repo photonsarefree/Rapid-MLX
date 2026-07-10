@@ -52,6 +52,8 @@ import mlx.core as mx
 # missing-class-attr to a class-default-None.
 from .accept_counter import get_global_counter
 from .cache_patch import patch_arrays_cache_rollback_state
+from .compiled_verify import compiled_verify_enabled
+from .compiled_verify import get_bank as get_compiled_verify_bank
 from .draft_k_controller_v2 import DepthController, get_or_create_controller
 
 patch_arrays_cache_rollback_state()
@@ -316,6 +318,15 @@ def mtp_generate_step(
         "true",
         "on",
     )
+    # Lever E8: compiled verify forward. RAPID_MLX_MTP_COMPILED_VERIFY=1
+    # replaces the per-round Python graph build of the (K+1)-token verify
+    # (~4.2ms CPU at K=2) with an mx.compile replay over explicit cache
+    # leaves. Default OFF. Any ineligibility falls back to the eager
+    # forward per call, so the emitted stream is identical either way
+    # (bit-exactness measured: greedy fingerprint unchanged).
+    _cv_bank = None
+    if compiled_verify_enabled():
+        _cv_bank = get_compiled_verify_bank(model)
     _t_acc = {"rounds": 0, "chain_s": 0.0, "build_s": 0.0, "eval_wait_s": 0.0, "host_s": 0.0}
 
     def _t_dump():
@@ -438,12 +449,23 @@ def mtp_generate_step(
     def _step_backbone(yy, prev, n_predict=1, n_confirmed=0, xtc_draw=None):
         """Run backbone on ``yy`` and return (tokens, logprobs, accept_lps, hidden, prev)."""
         with mx.stream(generation_stream):
-            logits, hidden = model(
-                yy[None],
-                cache=model_cache,
-                return_hidden=True,
-                n_confirmed=n_confirmed,
-            )
+            # Lever E8: verify rounds (n_predict > 1, committed prefix
+            # tagged) replay the compiled verify graph when eligible.
+            # ``forward_verify`` mirror-commits the cache state itself
+            # and returns None on any ineligibility, in which case the
+            # eager forward below runs exactly as before.
+            result = None
+            if _cv_bank is not None and n_predict > 1 and n_confirmed > 0:
+                result = _cv_bank.forward_verify(yy[None], model_cache, n_confirmed)
+            if result is not None:
+                logits, hidden = result
+            else:
+                logits, hidden = model(
+                    yy[None],
+                    cache=model_cache,
+                    return_hidden=True,
+                    n_confirmed=n_confirmed,
+                )
             logits = logits[:, -n_predict:, :]
             quantize_cache_fn(model_cache)
 
@@ -737,6 +759,23 @@ def mtp_generate_step(
         _fixed_k = min(_fixed_k, max(1, max_k))
         max_k_effective = _fixed_k
         _controller = None
+
+    # Lever E8: trace/refresh the compiled verify entries for every verify
+    # window this request can produce, BEFORE the first round. The depth
+    # controller's cost EWMA samples every round's wall time; paying the
+    # one-time compile traces inside a round seeds the per-K cost model
+    # ~3x too high and it parks the drafter for the rest of the request
+    # (measured: 95.7 -> 78.2 tok/s through the server bench, fingerprint
+    # unchanged). At steady state (shapes already warm) this is a dict
+    # lookup per request.
+    if _cv_bank is not None:
+        _s_list = (
+            [_fixed_k + 1]
+            if _controller is None
+            else list(range(2, max_k_effective + 2))
+        )
+        with mx.stream(generation_stream):
+            _cv_bank.prewarm(model_cache, _s_list, n_confirmed=1)
 
     # next_k: the K the controller wants for the UPCOMING round. Determines
     # whether we generate a draft at end of the current round. Bootstrap
