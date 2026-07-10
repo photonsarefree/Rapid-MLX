@@ -256,10 +256,6 @@ def patch_gated_delta_net_for_mtp() -> bool:
                 qkv = mx.where(mask[..., None], qkv, 0)
             conv_input = mx.concatenate([conv_state, qkv], axis=1)
             n_keep = self.conv_kernel_size - 1
-            # Conv state AT BOUNDARY (after processing n_conf tokens):
-            # the last n_keep entries of conv_input[:, : n_conf + n_keep].
-            # Equivalently conv_input[:, n_conf : n_conf + n_keep].
-            conv_snap = mx.contiguous(conv_input[:, n_conf : n_conf + n_keep, :])
             # Conv state AT END (after processing all S tokens):
             # last n_keep entries of conv_input.
             conv_post = mx.contiguous(conv_input[:, -n_keep:, :])
@@ -281,62 +277,71 @@ def patch_gated_delta_net_for_mtp() -> bool:
             q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
             k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-            # Chunk 1: [0:n_conf]
-            q1 = q[:, :n_conf]
-            k1 = k[:, :n_conf]
-            v1 = v[:, :n_conf]
-            a1 = a[:, :n_conf]
-            b1 = b[:, :n_conf]
-            mask1 = mask[:, :n_conf] if mask is not None else None
-            out1, state_at_boundary = gated_delta_update(
-                q1,
-                k1,
-                v1,
-                a1,
-                b1,
-                self.A_log,
-                self.dt_bias,
-                state,
-                mask1,
-                use_kernel=not self.training,
-            )
+            # MTPLX-lift P3: multi-boundary chunk-split. The window is
+            # ``[committed-prefix (n_conf tokens), draft_1 .. draft_K]``
+            # (K = S - n_conf). A rejection can strand the accept walk
+            # at ANY prefix length in [n_conf, S), so snapshot the
+            # (conv, ssm) state at EVERY boundary in that range: the
+            # scan runs as one chunk over the committed prefix, then
+            # one single-token chunk per draft position. For the K=1
+            # window this degenerates to exactly the previous
+            # two-chunk split (boundaries == [n_conf]); K>=2 costs one
+            # extra ``gated_delta_update`` dispatch per additional
+            # draft. Conv snapshots are cheap slices of ``conv_input``
+            # (the conv state is a sliding window, no scan dependency);
+            # ssm snapshots are the chunk-boundary states the next
+            # chunk consumes anyway — kept alive by reference, no
+            # extra copy.
+            boundaries = list(range(n_conf, S))
+            cuts = [0, *boundaries, S]
+            outs = []
+            snapshots: dict[int, tuple] = {}
+            cur_state = state
+            for lo, hi in zip(cuts[:-1], cuts[1:]):
+                if lo == hi:
+                    # n_conf == 0 never reaches here (fast-path guard),
+                    # but keep the degenerate-slice guard for safety.
+                    continue
+                mask_c = mask[:, lo:hi] if mask is not None else None
+                out_c, cur_state = gated_delta_update(
+                    q[:, lo:hi],
+                    k[:, lo:hi],
+                    v[:, lo:hi],
+                    a[:, lo:hi],
+                    b[:, lo:hi],
+                    self.A_log,
+                    self.dt_bias,
+                    cur_state,
+                    mask_c,
+                    use_kernel=not self.training,
+                )
+                outs.append(out_c)
+                if hi < S:
+                    # ``hi`` tokens of the window are now folded into
+                    # the state — this is the rollback target when the
+                    # accept walk keeps exactly ``hi`` positions.
+                    conv_snap = mx.contiguous(
+                        conv_input[:, hi : hi + n_keep, :]
+                    )
+                    snapshots[hi] = (conv_snap, cur_state)
 
-            # Snapshot conv state at boundary + ssm state at boundary.
-            # _rollback_draft restores (cache[0], cache[1]) from this.
-            cache.rollback_state = (conv_snap, state_at_boundary)
+            # _rollback_draft picks snapshots[kept_prefix_len] and
+            # restores (cache[0], cache[1]) from it.
+            cache.rollback_state = snapshots
 
-            # Chunk 2: [n_conf:S]
-            q2 = q[:, n_conf:]
-            k2 = k[:, n_conf:]
-            v2 = v[:, n_conf:]
-            a2 = a[:, n_conf:]
-            b2 = b[:, n_conf:]
-            mask2 = mask[:, n_conf:] if mask is not None else None
-            out2, state_final = gated_delta_update(
-                q2,
-                k2,
-                v2,
-                a2,
-                b2,
-                self.A_log,
-                self.dt_bias,
-                state_at_boundary,
-                mask2,
-                use_kernel=not self.training,
-            )
-
-            out = mx.concatenate([out1, out2], axis=1)
-            cache[1] = state_final
+            out = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=1)
+            cache[1] = cur_state
             # Advance the cache position by the FULL chunk length S —
             # this exactly mirrors the upstream
             # ``GatedDeltaNet.__call__`` (mlx_lm/models/qwen3_5.py
             # line 196-198 in 0.31.3), which always calls
             # ``cache.advance(S)`` when cache is non-None at end of
             # forward. Our chunk-split path consumes the same S
-            # tokens, just in two sub-calls to gated_delta_update;
-            # the net advance is identical to the upstream single-
-            # call path. No double-advance: there is no other
-            # ``advance`` along this code path.
+            # tokens, just in 1 + K sub-calls to gated_delta_update
+            # (committed prefix + one per draft boundary); the net
+            # advance is identical to the upstream single-call path.
+            # No double-advance: there is no other ``advance`` along
+            # this code path.
             cache.advance(S)
 
             out = self.norm(out, z)

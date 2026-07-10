@@ -520,8 +520,25 @@ def inject_mtp_support(
             hidden_states,
             next_token_ids,
             mtp_cache,
+            return_hidden: bool = False,
         ):
-            """Run the MTP head and project through the shared lm_head."""
+            """Run the MTP head and project through the shared lm_head.
+
+            MTPLX-lift P2: ``return_hidden=True`` additionally returns
+            the head's own post-norm hidden ``(B, N, H)`` (the
+            ``norm(fused)`` output that feeds the lm_head). The
+            generator detects this capability by signature and switches
+            chain-of-K from the target-hidden-frozen cascade to the
+            drafter-hidden cascade: draft N+1 is conditioned on the
+            head's OWN hidden at draft N instead of the frozen trunk
+            hidden (MTPLX's ``post_norm`` hidden_variant, where depth-2
+            conditional acceptance measured ~0.55 on this head family).
+            The head re-normalizes its hidden input
+            (``pre_fc_norm_hidden``), so the pre-norm-trunk vs
+            post-norm-drafter scale difference washes out on entry.
+            No-op at K=1 — the generator only requests hidden when
+            ``K >= 2``.
+            """
             mtp_out = self.mtp(
                 hidden_states,
                 next_token_ids,
@@ -529,8 +546,12 @@ def inject_mtp_support(
                 mtp_cache,
             )
             if self.args.tie_word_embeddings:
-                return self.model.embed_tokens.as_linear(mtp_out)
-            return self.lm_head(mtp_out)
+                logits = self.model.embed_tokens.as_linear(mtp_out)
+            else:
+                logits = self.lm_head(mtp_out)
+            if return_hidden:
+                return logits, mtp_out
+            return logits
 
         def make_mtp_cache(self):
             """Return fresh ``KVCache`` entries — one per MTP layer.

@@ -1438,6 +1438,17 @@ def _install_mtp_vendored(
         )
         return False
 
+    # Qwen3.6 checkpoints load as VLM-style wrappers: qwen3_5_inject
+    # installs the MTP surfaces on the inner ``TextModel``
+    # (``model.language_model``), not the outer wrapper the engine
+    # holds. Resolve the inner model here — the generator's contract
+    # (``model.layers`` / ``mtp_forward`` / ``__call__(return_hidden=...)``)
+    # is the inner model's interface.
+    if not hasattr(model, "mtp_forward"):
+        _inner_lm = getattr(model, "language_model", None)
+        if _inner_lm is not None and hasattr(_inner_lm, "mtp_forward"):
+            model = _inner_lm
+
     if not (
         hasattr(model, "mtp_forward")
         and hasattr(model, "make_mtp_cache")
@@ -1592,45 +1603,71 @@ def _install_mtp_vendored(
             except Exception:  # noqa: BLE001
                 pass
 
-    def _is_greedy_for_uid(uid: int) -> bool:
-        """Return True when the request behind ``uid`` sampled at temp=0.
+    def _mtp_sampling_for_uid(uid: int) -> tuple | None:
+        """Resolve the sampling params MTP should speculate under.
 
-        K=1 MVP: matches the greedy contract that
-        ``vllm_mlx/spec_decode/mtp/generator.py::mtp_generate_step``
-        implements with ``temp=0.0``. Under temp>0, the vendored
-        generator can still preserve the lossless marginal via its
-        residual-distribution sample on reject — but the MVP install
-        hard-codes ``temp=0.0`` into the generator constructor, so any
-        request with temperature>0 would silently receive a
-        different sampled marginal.
+        Returns ``(temperature, top_p, top_k, min_p)`` when the
+        request's sampler is resolvable, else ``None`` (fail closed →
+        plain decode via ``_orig_step``).
 
-        Codex round-A blocker #1: fail closed on unresolvable metadata.
-        Prior revision returned ``True`` when ``uid_to_request_id`` or
-        ``requests`` were ``None`` (or the request lookup failed) —
-        that would silently apply greedy sampling to a temp>0 request
-        whose bookkeeping had just been evicted. Return ``False`` here
-        so the caller falls through to ``_orig_step()`` (which reads
-        the real sampler from ``gb.samplers[0]``) instead of applying
-        the MTP-hardcoded greedy path.
+        MTPLX-lift P1: the vendored generator has always implemented
+        the full Leviathan–Chen accept (min(1, p/q)) with residual
+        resampling for temp>0 — the K=1 MVP install simply never
+        exercised it, hard-coding ``temp=0.0`` and routing every
+        sampled request to plain decode. That made MTP greedy-only in
+        production (thinking-mode traffic at temp 0.6/0.7 decoded at
+        the AR rate). We now pass the request's own sampling params
+        into the generator; speculation stays lossless in
+        distribution (same marginal as plain sampling).
 
-        Codex round-B blocker: also fail closed when ``temperature is
-        None``. ``vllm_mlx.request.SamplingParams`` defaults
-        ``temperature=0.7`` (not zero) and ``None`` is not a normal
-        value — it typically signals "use the server / OpenAI-route
-        default," which is likewise nonzero. Treating a bare ``None``
-        as greedy would silently apply the MTP-hardcoded ``temp=0.0``
-        marginal to a request the operator meant to sample stochast-
-        ically. Only an EXPLICIT ``0.0`` passes the gate; every other
-        shape falls through to plain decode.
+        ``RAPID_MLX_MTP_GREEDY_ONLY=1`` restores the old gate
+        (speculate only at an explicit ``temperature == 0.0``).
+
+        Codex round-A blocker #1 (retained): fail closed on
+        unresolvable metadata — ``None`` here means the caller must
+        fall through to ``_orig_step()``, which reads the real
+        sampler from ``gb.samplers[0]``.
+
+        Codex round-B blocker (retained): ``temperature is None``
+        signals "use the server / OpenAI-route default" that this
+        layer cannot see — fail closed rather than guessing.
         """
         if uid_to_request_id is None or requests is None:
-            return False
+            return None
         req_id = uid_to_request_id.get(uid)
         req = requests.get(req_id) if req_id else None
         if req is None or getattr(req, "sampling_params", None) is None:
-            return False
-        temp = getattr(req.sampling_params, "temperature", None)
-        return temp == 0.0
+            return None
+        sp = req.sampling_params
+        temp = getattr(sp, "temperature", None)
+        if temp is None or temp < 0.0:
+            return None
+        if temp == 0.0:
+            # Greedy: filters are no-ops at argmax; normalize so the
+            # mid-stream change detector doesn't fire on top_p noise.
+            # (Seeded greedy is fine — argmax never touches the RNG.)
+            return (0.0, 0.0, 0, 0.0)
+        if getattr(sp, "seed", None) is not None:
+            # H-11 determinism contract: seeded temp>0 requests must
+            # reproduce token-for-token. The vendored generator samples
+            # through the process-global RNG (categorical draws, accept
+            # uniforms, residual sampling) and does not thread a
+            # per-request key — speculating would keep the marginal but
+            # lose reproducibility. Fail closed to plain decode, where
+            # make_seeded_sampler honours the seed.
+            return None
+        if os.environ.get("RAPID_MLX_MTP_GREEDY_ONLY", "").strip() in (
+            "1",
+            "true",
+            "on",
+        ):
+            return None
+        return (
+            float(temp),
+            float(getattr(sp, "top_p", 0.0) or 0.0),
+            int(getattr(sp, "top_k", 0) or 0),
+            float(getattr(sp, "min_p", 0.0) or 0.0),
+        )
 
     def _mtp_step():
         """Wrapped ``GenerationBatch._step`` for --spec-decode mtp.
@@ -1831,13 +1868,14 @@ def _install_mtp_vendored(
                 _stats["ft_disabled"] += 1
                 return _orig_step()
 
-        if not _is_greedy_for_uid(uid):
+        _sampling = _mtp_sampling_for_uid(uid)
+        if _sampling is None:
             _stats["fallthrough_steps"] += 1
             _stats["ft_non_greedy"] += 1
             # Codex round-L BLOCKING #3: prior round-H revision raised
-            # ``RuntimeError`` here when sampling switched to non-
-            # greedy after MTP had already emitted. That killed the
-            # request on a legitimate runtime sampling-param change.
+            # ``RuntimeError`` here when sampling became unresolvable
+            # after MTP had already emitted. That killed the request
+            # on a legitimate runtime sampling-param change.
             #
             # Round-L fix: hand off to ``_orig_step`` regardless of
             # state. The MTP generator is closed and the uid is
@@ -1845,17 +1883,60 @@ def _install_mtp_vendored(
             # Same bounded stream-artifact tradeoff as the B>1 handoff
             # above; see :func:`_log_mtp_mid_stream_handoff_once` for
             # the operator-facing WARN contract.
+            #
+            # MTPLX-lift P1: this branch now fires only for
+            # unresolvable sampler metadata (or the
+            # RAPID_MLX_MTP_GREEDY_ONLY kill switch) — temp>0 itself
+            # no longer falls through.
             if uid in _state:
                 _stats["ft_mid_stream_handoff"] += 1
                 _log_mtp_mid_stream_handoff_once(
                     uid,
                     "non_greedy",
-                    "sampling switched to temperature > 0 mid-stream",
+                    "sampling params became unresolvable mid-stream",
                 )
                 _record_terminal_disable(uid)
             else:
                 _mark_disabled(uid)
             return _orig_step()
+
+        # MTPLX-lift P1: the generator is constructed with the
+        # request's sampling params frozen in. If they change
+        # mid-stream (only possible via external mutation of
+        # ``sampling_params``), continuing with the stale generator
+        # would sample the wrong marginal. Same handoff pattern as
+        # round-L. Guard: uid REUSE (a different request drawing the
+        # same uid) also shows up as a "changed" comparison here — but
+        # that case belongs to the round-K reuse block below, which
+        # rebuilds cleanly for the new request. Only treat this as a
+        # mid-stream change when the stashed request_id matches the
+        # current one (or neither side is resolvable — the
+        # bench-harness shape, where uids are never reused).
+        _stale = _state.get(uid)
+        if _stale is not None and _stale.get("sampling") not in (
+            None,
+            _sampling,
+        ):
+            _cur_req_id = (
+                uid_to_request_id.get(uid)
+                if uid_to_request_id is not None
+                else None
+            )
+            _stale_req_id = _stale.get("request_id")
+            if (
+                _stale_req_id is None
+                or _cur_req_id is None
+                or _stale_req_id == _cur_req_id
+            ):
+                _stats["fallthrough_steps"] += 1
+                _stats["ft_mid_stream_handoff"] += 1
+                _log_mtp_mid_stream_handoff_once(
+                    uid,
+                    "sampling_changed",
+                    "sampling params changed mid-stream",
+                )
+                _record_terminal_disable(uid)
+                return _orig_step()
 
         _lp = getattr(gb, "logits_processors", None)
         if _lp and any(p for p in _lp if p):
@@ -1978,7 +2059,14 @@ def _install_mtp_vendored(
                     model=model,
                     max_tokens=gen_max,
                     prompt_cache=gb.prompt_cache,
-                    temp=0.0,
+                    # MTPLX-lift P1: speculate under the request's own
+                    # sampler. The generator's Leviathan–Chen accept +
+                    # residual resample keeps the emitted marginal
+                    # identical to plain sampling at these params.
+                    temp=_sampling[0],
+                    top_p=_sampling[1],
+                    top_k=_sampling[2],
+                    min_p=_sampling[3],
                     # 0.9.13 PR-B: EV depth controller.
                     model_id=controller_key or f"mtp-model-{id(model)}",
                     max_k=max_k,
@@ -2036,6 +2124,9 @@ def _install_mtp_vendored(
                 "queue": [],
                 "primed": True,
                 "request_id": _first_call_req_id,
+                # MTPLX-lift P1: params the generator was built with,
+                # for the mid-stream change detector at wrapper entry.
+                "sampling": _sampling,
             }
             _stats["vendored_steps"] += 1
             # Codex round-I BLOCKING #2 / round-J BLOCKING #2+#3:
@@ -5722,6 +5813,45 @@ class Scheduler:
             # compressed subsequence so a stored entry would be keyed by
             # positions that do not match any real prompt prefix.
             pflash_skip_store = request is not None and _pflash_compressed(request)
+
+            # MTPLX-lift reviewer fix (BLOCKING): a request abandoned
+            # mid-verify-round by a scheduler-side termination the MTP
+            # generator cannot see (stop-string match between
+            # accepted-draft emissions) leaves speculative positions
+            # folded into the extracted cache — including the
+            # non-trimmable GDN recurrent state. Storing that entry
+            # would corrupt any future request that prefix-matches it.
+            # Clean caches at finish have layer offsets <= len(prompt+
+            # output) (the terminal token is emitted un-forwarded);
+            # speculative overshoot is strictly greater. Skip the store
+            # on overshoot — losing one warm-prefix entry is the safe
+            # trade.
+            if (
+                request is not None
+                and hasattr(request, "_extracted_cache")
+                and request._extracted_cache is not None
+            ):
+                _expected_pos = len(request.prompt_token_ids or []) + len(
+                    request.output_token_ids or []
+                )
+                for _layer_cache in request._extracted_cache:
+                    _off = getattr(_layer_cache, "offset", None)
+                    try:
+                        _off_int = int(_off) if _off is not None else None
+                    except (TypeError, ValueError):
+                        _off_int = None
+                    if _off_int is not None and _off_int > _expected_pos:
+                        logger.warning(
+                            "[cache_store] skipping prefix-cache store "
+                            "for %s: cache offset %d > prompt+output %d "
+                            "(request finished mid-speculative-round; "
+                            "state contains unemitted draft positions)",
+                            request_id,
+                            _off_int,
+                            _expected_pos,
+                        )
+                        pflash_skip_store = True
+                        break
 
             # Store cache for future reuse
             if (

@@ -38,6 +38,7 @@ adjustments.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections.abc import Callable, Generator
 from functools import partial
@@ -294,6 +295,11 @@ def mtp_generate_step(
         mtp_cache = prompt_cache[n_main:] or model.make_mtp_cache()
 
     _is_greedy = temp == 0
+    _trim_fix = os.environ.get("RAPID_MLX_MTP_TRIM_FIX", "").strip() in (
+        "1",
+        "true",
+        "on",
+    )
 
     _filter_chain, _xtc_cell = (
         _make_sampler_chain(
@@ -349,36 +355,48 @@ def mtp_generate_step(
     def _rollback_draft(n_to_drop: int = 1):
         """Restore caches by dropping the last ``n_to_drop`` draft tokens.
 
-        SSM layers (ArraysCache): restore the conv/ssm snapshot saved
-        by GatedDeltaNet at the confirmed boundary. The snapshot is
-        taken at a SINGLE offset (``n_confirmed`` positions from end),
-        so ``n_to_drop`` MUST match that offset — chain-of-K with
-        partial accept is not representable in the current one-snapshot
-        model. The generator prevents this by clamping ``max_k`` to 1
-        when any SSM cache is present (see ``_has_ssm_cache`` at
-        decode-loop start); callers that reach this path with
-        ``n_to_drop > 1`` on an SSM cache trip an assertion because a
-        silent partial-rollback would corrupt the SSM state and break
-        the lossless contract.
+        SSM layers (ArraysCache): restore the (conv, ssm) snapshot
+        saved by the GatedDeltaNet chunk-split at the boundary the
+        accept walk stopped at. MTPLX-lift P3: ``rollback_state`` is a
+        dict mapping kept-prefix-length → snapshot, populated at every
+        boundary of the verify window, so partial accept at ANY depth
+        of a chain-of-K round is representable (previously a single
+        snapshot at one offset limited GDN-hybrid targets to K=1).
 
         Attention layers (KVCache): trim the last ``n_to_drop`` draft
         entries.
         """
         for c in model_cache:
-            if hasattr(c, "rollback_state") and c.rollback_state is not None:
-                # SSM path: single-snapshot rollback, only n_to_drop==1
-                # is representable in the current on-disk snapshot slot.
-                # The controller-side clamp keeps chain-of-K away from
-                # this branch; assert here as a defense in depth in case
-                # a caller wires K>=2 without adjusting the SSM cache.
-                if n_to_drop != 1:
+            if hasattr(c, "rollback_state"):
+                if c.rollback_state is None:
+                    # A GDN cache with no snapshot while dropping
+                    # tokens means the chunk-split didn't run for the
+                    # verify forward (e.g. a future TP path) — a
+                    # silent no-op here would corrupt the recurrent
+                    # state, so fail loudly (reviewer NIT, MTPLX-lift
+                    # round).
                     raise AssertionError(
-                        f"_rollback_draft(n_to_drop={n_to_drop}) on SSM "
-                        "cache: only single-token rollback is supported. "
-                        "Chain-of-K on SSM-hybrid targets is not wired "
-                        "yet — the generator should have clamped max_k=1."
+                        "_rollback_draft: GDN cache has no rollback "
+                        f"snapshot while dropping {n_to_drop} tokens "
+                        "(chunk-split did not run for this verify)."
                     )
-                conv_snap, ssm_snap = c.rollback_state
+                snaps = c.rollback_state
+                # The verify window had max(snaps)+1 positions
+                # (boundaries run [n_conf, S) — the last is S-1).
+                # Keeping ``window - n_to_drop`` positions lands on a
+                # snapshotted boundary by construction; a miss means a
+                # plumbing bug, so fail loudly rather than corrupt the
+                # recurrent state.
+                keep = (max(snaps) + 1) - n_to_drop
+                snap = snaps.get(keep)
+                if snap is None:
+                    raise AssertionError(
+                        f"_rollback_draft(n_to_drop={n_to_drop}): no "
+                        f"GDN snapshot at kept-prefix {keep}; have "
+                        f"{sorted(snaps)}. Verify-window/chunk-split "
+                        "boundary mismatch."
+                    )
+                conv_snap, ssm_snap = snap
                 c[0] = conv_snap
                 c[1] = ssm_snap
                 c.rollback_state = None
@@ -396,6 +414,43 @@ def mtp_generate_step(
             )
             logits = logits[:, -n_predict:, :]
             quantize_cache_fn(model_cache)
+
+            # MTPLX-lift perf fix (vectorized verify sampling): the
+            # per-position loop below builds a separate full-vocab
+            # sampling subgraph per verify row — ~1-1.5ms/round of
+            # serialized Python graph construction at K=2, which alone
+            # cancelled depth-2's tokens/round gain at greedy. When no
+            # logits processors and no XTC draw sharing are in play
+            # (the production shape), sample all n_predict rows in ONE
+            # batched graph: every filter in the chain (top-p/top-k/
+            # min-p, mlx-lm sample_utils) and categorical_sampling
+            # operate on the last axis and broadcast over rows.
+            # Greedy output is bit-identical to the loop (argmax);
+            # temp>0 consumes the RNG in one batched draw instead of
+            # n sequential draws — same marginal distribution.
+            if not logits_processors and _xtc_cell is None:
+                rows = logits[0]  # (n_predict, V)
+                logprobs_all = rows - mx.logsumexp(rows, axis=-1, keepdims=True)
+                if _filter_chain:
+                    masked = logprobs_all
+                    for f in _filter_chain:
+                        masked = f(masked)
+                    toks_v = categorical_sampling(masked, temp)
+                    scaled = masked / temp
+                    alps_v = scaled - mx.logsumexp(
+                        scaled, axis=-1, keepdims=True
+                    )
+                elif _is_greedy:
+                    toks_v = mx.argmax(logprobs_all, axis=-1)
+                    alps_v = logprobs_all
+                else:
+                    toks_v = categorical_sampling(logprobs_all, temp)
+                    scaled = logprobs_all / temp
+                    alps_v = scaled - mx.logsumexp(
+                        scaled, axis=-1, keepdims=True
+                    )
+                return toks_v, logprobs_all, alps_v, hidden, prev
+
             toks: list = []
             lps: list = []
             accept_lps: list = []
@@ -530,10 +585,6 @@ def mtp_generate_step(
                 cache_commit=cur_commit,
                 want_hidden=_mtp_supports_hidden and K >= 2,
             )
-            # Materialize before chaining — the next iteration needs
-            # ``prev_tok.item()`` inside ``_step_mtp`` (via reshape,
-            # not .item(), but the MLX graph needs the value pinned).
-            mx.eval(d_tok)
             draft_toks.append(d_tok)
             draft_lps.append(d_lp)
             draft_accept_lps.append(d_alp)
@@ -545,9 +596,19 @@ def mtp_generate_step(
             # ``hidden_last`` constant on injects that don't expose
             # ``return_hidden`` (Qwen 3.5 today).
             if d_hidden is not None:
-                mx.eval(d_hidden)
                 cur_hidden = d_hidden
             cur_commit = None
+        # MTPLX-lift perf fix: the chain used to block on
+        # ``mx.eval(d_tok)`` (and ``d_hidden``) after EVERY draft —
+        # K host↔GPU round-trips per round before the verify even
+        # started, which ate the whole depth-2 tokens/round gain.
+        # Chaining lazily is legal (the next ``mtp_forward`` consumes
+        # ``prev_tok``/``cur_hidden`` as graph inputs, never via
+        # ``.item()``); one eval at chain end bounds the pending graph
+        # while costing a single sync regardless of K. (MTPLX solves
+        # the same overhead with an mx.compile'd fused draft core;
+        # this is the dependency-only version.)
+        mx.eval(*draft_toks)
         return draft_toks, draft_lps, draft_accept_lps, xtc_draws
 
     def _prefill(yy, embeddings):
@@ -606,39 +667,40 @@ def mtp_generate_step(
     # chain-of-K on SSM targets needs the ``PrepareSnapshots([offsets])``
     # per-position machinery, which is a separate work item.
     # ------------------------------------------------------------------
-    # SSM detection: patched ArraysCache carries a ``rollback_state``
-    # class attribute (see ``cache_patch.py``); KVCache does not. This
-    # is the cheapest, most stable class-level signal for the SSM path
-    # available without importing the two cache classes here.
-    _has_ssm_cache = any(hasattr(c, "rollback_state") for c in model_cache)
+    # MTPLX-lift P3: the SSM clamp is GONE. The GatedDeltaNet
+    # chunk-split (cache_patch.py) now snapshots (conv, ssm) at EVERY
+    # boundary of the verify window, so partial accept at any depth is
+    # representable and chain-of-K runs on GDN-hybrid targets
+    # (Qwen3.5/3.6) exactly as on pure-attention ones. Measured basis
+    # (MTPLX, same weights + sidecar, M4 Max): depth-2 conditional
+    # acceptance ~0.55 with the drafter-hidden cascade → ~+21%
+    # tokens/verify-round at ~+14% round cost.
     if not disable_auto_k:
-        # Chain-of-K on SSM targets not implemented; clamp to K=1 with
-        # a startup log (once per generator instance is cheap enough
-        # given ``mtp_generate_step`` is called per-request).
-        _max_k_hw = 1 if _has_ssm_cache else max(0, max_k)
-        if _has_ssm_cache and max_k > 1:
-            logger.info(
-                "[MTP-chain-of-K] SSM cache detected in model_cache — "
-                "clamping max_k from %d to 1 (chain-of-K on SSM-hybrid "
-                "targets needs per-position snapshots not yet wired). "
-                "Set --mtp-max-k=1 to silence this log.",
-                max_k,
-            )
-        max_k_effective = _max_k_hw
+        max_k_effective = max(0, max_k)
         _controller: DepthController | None = get_or_create_controller(
             model_id or "__default__", max_k=max_k_effective
         )
+        _fixed_k = 1
     else:
-        # ``disable_auto_k`` keeps the pre-0.9.13 fixed-K=1 A/B-bench
-        # behavior — no controller, no chain-of-K, verbatim chain-of-1.
-        max_k_effective = 1
+        # ``disable_auto_k`` = fixed-K bench behavior — no controller,
+        # no EV adaptation. K defaults to the pre-0.9.13 chain-of-1;
+        # RAPID_MLX_MTP_FIXED_K overrides for fixed-depth A/Bs
+        # (MTPLX-lift P3; capped by --mtp-max-k).
+        try:
+            _fixed_k = max(
+                1, int(os.environ.get("RAPID_MLX_MTP_FIXED_K", "1"))
+            )
+        except ValueError:
+            _fixed_k = 1
+        _fixed_k = min(_fixed_k, max(1, max_k))
+        max_k_effective = _fixed_k
         _controller = None
 
     # next_k: the K the controller wants for the UPCOMING round. Determines
     # whether we generate a draft at end of the current round. Bootstrap
     # value is the controller's initial pick_k (0 if fresh, else the
     # scheduled depth from the previous request).
-    next_k = _controller.pick_k() if _controller is not None else 1
+    next_k = _controller.pick_k() if _controller is not None else _fixed_k
 
     def _record_round(k_used: int, round_wall_ms: float, accepts: list[bool]) -> None:
         """Fold a round outcome into the controller (if enabled)."""
@@ -667,7 +729,7 @@ def mtp_generate_step(
                 return
 
             # Decide K for the NEXT round.
-            next_k = _controller.pick_k() if _controller is not None else 1
+            next_k = _controller.pick_k() if _controller is not None else _fixed_k
 
             hidden_at_main = hidden[:, -1:, :]
             if next_k >= 1:
@@ -726,22 +788,26 @@ def mtp_generate_step(
                 y_with_drafts,
                 prev_tokens,
                 n_predict=k_len + 1,
-                # n_confirmed = k_len only matters on SSM targets (which
-                # are clamped to k_len=1 above). Passing k_len keeps the
-                # semantics uniform: "the last k_len positions are
-                # drafts, snapshot before them".
-                n_confirmed=k_len,
+                # n_confirmed = committed-prefix length. The window is
+                # [y, d_1..d_K]: exactly ONE committed token, then K
+                # drafts. The GDN chunk-split snapshots every boundary
+                # in [n_confirmed, K+1) so any partial accept can roll
+                # back (MTPLX-lift P3). The pre-P3 code passed k_len
+                # here, which coincided with 1 at the then-forced K=1
+                # but would mislabel the first draft as committed at
+                # K>=2.
+                n_confirmed=1,
                 xtc_draw=first_xtc_draw,
             )
 
-            # One shared uniform for all positions' probabilistic
-            # accept tests. Ollama uses a per-position Bernoulli draw;
-            # at greedy temp=0 the draw is ignored (accept iff argmax
-            # match), so this only matters for temp>0 where the same
-            # ``u`` biases all positions the same way — closer to
-            # Ollama's per-position draw than reusing the sampler
-            # chain's XTC cell would be.
-            u = mx.random.uniform()
+            # Per-position uniforms for the probabilistic accept tests
+            # (canonical Leviathan–Chen: independent draw per position).
+            # A prior revision shared ONE uniform across all K positions,
+            # which correlates accept decisions within a round — with
+            # the temp>0 path now live in production (MTPLX-lift P1),
+            # match the canonical scheme. At greedy temp=0 the draws
+            # are ignored (accept iff argmax match).
+            u = mx.random.uniform(shape=(k_len,))
             drafts_i32 = drafts_arr.astype(mx.int32)
 
             # --------------------------------------------------------
@@ -830,27 +896,99 @@ def mtp_generate_step(
             round_wall_ms = (time.perf_counter() - round_start_perf) * 1000.0
             _record_round(k_len, round_wall_ms, accepts_for_record)
 
-            # Emit the accepted drafts (capped at EOS position when set).
-            for i in range(accepted_count):
+            # --------------------------------------------------------
+            # Reviewer fix (MTPLX-lift round, BLOCKING): reconcile ALL
+            # caches to the final committed boundary BEFORE the first
+            # yield of the round. The generator is a one-token-per-step
+            # coroutine — the scheduler may abandon it suspended at any
+            # yield (accepted-draft EOS, max_tokens, stop-string), and
+            # on request finish the live cache is stored into the
+            # prefix cache keyed by prompt+output. Pre-fix, rollback
+            # ran AFTER the accepted-draft yields (and the eos_cut
+            # path never rolled back at all), so a mid-round
+            # termination at K>=2 stored a cache with rejected or
+            # accepted-but-unemitted draft positions irreversibly
+            # folded into the non-trimmable GDN state — silent
+            # cross-request corruption via warm-prefix reuse. At K=1
+            # every termination point coincidentally coincided with
+            # the committed boundary, which is why this never fired
+            # before chain-of-K.
+            #
+            # ``emit_drafts`` caps the accepted drafts against the
+            # remaining token budget so the boundary matches what will
+            # ACTUALLY be emitted; the bonus/residual terminal token
+            # is not part of the verify window's cache state, so it
+            # doesn't move the boundary. Stop-strings remain invisible
+            # to the generator — the scheduler-side prefix-store guard
+            # covers that case.
+            # --------------------------------------------------------
+            budget = max_tokens - ntoks  # >= 1 by loop condition
+            emit_drafts = min(accepted_count, budget)
+            n_to_drop = k_len - emit_drafts
+            if n_to_drop == 0:
+                # Whole window kept (all-accept, budget permitting).
+                _clear_rollback()
+            else:
+                _rollback_draft(n_to_drop)
+                if logits_processors and prev_tokens is not None:
+                    # Discard the dropped positions from prev_tokens
+                    # (they were appended by _step_backbone during the
+                    # batched verify).
+                    prev_tokens = prev_tokens[:-n_to_drop]
+                # Also trim mtp_cache for the dropped drafts. The MTP
+                # KV cache is per-layer KVCache (see qwen3_5_inject
+                # make_mtp_cache / gemma4_inject) — always trimmable.
+                #
+                # Reviewer finding (MTPLX-lift round, pre-existing):
+                # the chain wrote entries for INPUT tokens
+                # [main, d_1..d_{K-1}]; on a reject keeping ``a``
+                # drafts, only the entries for d_{a+1}..d_{K-1} are
+                # invalid — K-1-a of them, i.e. ``n_to_drop - 1``.
+                # Trimming ``n_to_drop`` also deletes the entry for
+                # the last COMMITTED input, permanently dropping one
+                # real context pair from the drafter's KV per reject
+                # round (drafter conditioning only; losslessness is
+                # unaffected). RAPID_MLX_MTP_TRIM_FIX=1 enables the
+                # corrected trim for A/B; default keeps the vendored
+                # behavior the K=1 baselines were measured under.
+                _mtp_drop = (
+                    max(n_to_drop - 1, 0) if _trim_fix else n_to_drop
+                )
+                if _mtp_drop > 0:
+                    for mc in mtp_cache:
+                        if mc.is_trimmable():
+                            mc.trim(_mtp_drop)
+            if accepted_count < k_len:
+                # A genuine drafter reject this round (budget cuts of
+                # an all-accept round are NOT rejects).
+                accept_counter.record_reject()
+
+            # Emit the accepted drafts (capped at EOS position when
+            # set, and at the token budget). Yield the TARGET's
+            # logprobs at each accepted position (``lps[i]`` from the
+            # batched verify — the same distribution the accept test
+            # used), not the drafter's: plain decode always reports
+            # target logprobs, and drafter numbers diverge visibly at
+            # temp>0.
+            for i in range(emit_drafts):
                 accept_counter.record_accept(tokens_saved=1)
                 ntoks += 1
-                yield int(draft_ids[i]), draft_lps_arr[i], True
+                yield int(draft_ids[i]), lps[i], True
                 if ntoks >= max_tokens:
                     return
 
             if eos_cut:
                 # Emitted EOS via an accepted draft. Caller will detect
                 # the stop token and terminate; skip bonus / residual /
-                # drafter-chain setup entirely. The cache is left with
-                # the un-emitted drafts past EOS still committed to it,
-                # but the request terminates here so the cache is
-                # discarded by the scheduler at request boundary.
+                # drafter-chain setup entirely. Caches were reconciled
+                # to the committed boundary above, so the state the
+                # scheduler extracts (and may store into the prefix
+                # cache) contains exactly prompt+output positions.
                 return
 
             if accepted_count == k_len:
                 # All K drafts accepted → emit the bonus token
                 # (target's prediction one past the last draft).
-                _clear_rollback()
                 ntoks += 1
                 yield bonus_id, lps[k_len], False
                 if ntoks >= max_tokens:
@@ -862,27 +1000,8 @@ def mtp_generate_step(
                 # Reject at position ``accepted_count``. Emit target's
                 # pre-sampled residual there (byte-equal to the prior
                 # ``verify_pred.item()`` on greedy since residual ==
-                # target argmax at temp=0), and drop the remaining
-                # (k_len - accepted_count) unaccepted drafts from the
-                # caches.
-                n_to_drop = k_len - accepted_count
-                _rollback_draft(n_to_drop)
-                accept_counter.record_reject()
-                if logits_processors and prev_tokens is not None:
-                    # Discard the ``n_to_drop`` rejected positions
-                    # from prev_tokens (they were appended by
-                    # _step_backbone during the batched verify).
-                    prev_tokens = prev_tokens[:-n_to_drop]
-
-                # Also trim mtp_cache by the same n_to_drop — those
-                # positions were appended by _step_mtp_chain and
-                # correspond to the rejected drafts. The MTP KV
-                # cache is per-layer KVCache (see qwen3_5_inject
-                # make_mtp_cache / gemma4_inject) — always trimmable.
-                for mc in mtp_cache:
-                    if mc.is_trimmable():
-                        mc.trim(n_to_drop)
-
+                # target argmax at temp=0); the caches were already
+                # rolled back to the committed boundary above.
                 verify_tok_id = int(residual_ids[accepted_count])
 
                 ntoks += 1
@@ -901,7 +1020,7 @@ def mtp_generate_step(
 
             # Decide K for the next round BEFORE generating the
             # next chain (a park decision skips drafter cost).
-            next_k = _controller.pick_k() if _controller is not None else 1
+            next_k = _controller.pick_k() if _controller is not None else _fixed_k
             if next_k >= 1:
                 # Chain-carry: on all-accept the mtp_cache must
                 # advance by one extra position for the just-accepted
